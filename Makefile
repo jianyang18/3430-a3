@@ -3,7 +3,7 @@
 CC     = gcc
 CFLAGS = -Wall -Werror -Wextra -Wpedantic -g
 TARGET = fat32
-SRC    = main.c
+SRC    = a3.c
 
 
 $(TARGET): $(SRC) fat32.h
