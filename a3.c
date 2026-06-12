@@ -12,7 +12,6 @@
 *   
 */
 
-#define _FILE_OFFSET_BITS 64
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,6 +31,7 @@
 #define FAT32_BAD 0x0FFFFFF7u
 #define FAT32_EOC_MIN 0x0FFFFFF8u
 #define DIR_ENTRY_SIZE 32
+#define _FILE_OFFSET_BITS 64
 
 
 
