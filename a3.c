@@ -6,8 +6,9 @@
 *   COURSE:             COMP 3430, SECTION: A01
 *   INSTRUCTOR:         Dr. Saulo dos Santos
 *   ASSIGNMENT:         assignment #3
-*   REMARKS:            Implement a simulator to mimic a multi-threaded 
-*                       CPU scheduler that follows the rules of MLFQ schedulling policy.
+*   REMARKS:            Reads a FAT32 formatted disk image and supports
+*                       three commands: info (drive metadata), list 
+*                       (directory tree), and get (extract a file).
 *   
 */
 
