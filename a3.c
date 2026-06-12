@@ -1,11 +1,11 @@
 /*
-*   a2.c
+*   a3.c
 *   
 *   NAME:               Jian Yang
 *   STUDENT NUMBER:     8000293
 *   COURSE:             COMP 3430, SECTION: A01
 *   INSTRUCTOR:         Dr. Saulo dos Santos
-*   ASSIGNMENT:         assignment #2
+*   ASSIGNMENT:         assignment #3
 *   REMARKS:            Implement a simulator to mimic a multi-threaded 
 *                       CPU scheduler that follows the rules of MLFQ schedulling policy.
 *   
@@ -399,10 +399,158 @@ static void cmd_list()
  * COMMAND 3: get 
  *  
  * --------------------------------- */
-// static void cmd_get(const char *path)
-// {
+
+ struct find_state {
+    char **parts;     // array of path components
+    int n_parts;   // total num of components
+    int cur_part;
+    int found;
+    uint32_t cluster;  
+    uint32_t file_size;
+    uint8_t attr;
+};
+
+static void find_cb(const struct DirInfo *e, void *userdata)
+{
+    struct find_state *fs = (struct find_state *)userdata;  // cast void* back to find_state
+
+    if (fs->found)
+    {
+        return;     // skip already checked entries
+    }
+
+    // format curr entry's name into a readable string
+    char name83[13];
+    format_83(name83, e->dir_name);
+
+    // compare entry name against curr path component
+    if (strcasecmp(name83, fs->parts[fs->cur_part]) != 0)
+    {
+        return;
+    }
+
+    // get first cluster of this entry
+    uint32_t cluster = ((uint32_t)e->dir_first_cluster_hi << 16) | (uint32_t)e->dir_first_cluster_lo;
+
+    if (fs->cur_part == fs->n_parts - 1) 
+    {
+        // store result back into find_state struct
+        fs->found = 1;  // true
+        fs->cluster = cluster;
+        fs->file_size = e->dir_file_size;
+        fs->attr = e->dir_attr;
+    }
+    else if (e->dir_attr & ATTR_DIRECTORY)
+    {
+        // directory, move into subdirectory
+        fs->cur_part++;
+        walk_dir(cluster, find_cb, fs);
+
+        if (!fs->found)
+        {
+            fs->cur_part--; // backtrack cur_part
+        }
+    }
+
+
+}
+
+static void cmd_get(const char *path)
+{
+    char *path_copy = strdup(path);     // save a copy
+
+    // split path into parts
+    char *parts[64];
+    int n_parts = 0;
+
+    char *token = strtok(path_copy, "/\\");
+
+    while (token && n_parts < 64) {
+        parts[n_parts++] = token;
+        token = strtok(NULL, "/\\");
+    }
+
+    // validate if path is found
+    if (n_parts == 0) {
+        fprintf(stderr, "Invalid path: %s\n", path);
+        
+        return;
+    }
+
+    struct find_state fs;
+    memset(&fs, 0, sizeof(fs));
     
-// }
+    // set path parts
+    fs.parts = parts;
+    fs.n_parts = n_parts;
+
+    // traverse the dir tree
+    walk_dir(image_bs.BPB_RootClus, find_cb, &fs);
+
+    // ===== if file not found -> doesn't exist on the disk
+    if (!fs.found) {
+        fprintf(stderr, "File not found: %s\n", path);
+        free(path_copy);
+
+        return;
+    }
+
+    // ===== found a directory (can't print out or save a directory)
+    if (fs.attr & ATTR_DIRECTORY) {
+        fprintf(stderr, "%s is a directory, not a file\n", path);
+        free(path_copy);
+
+        return;
+    }
+
+    // ===== found a valid file
+    mkdir("get_cmd_output", 0755);  // owner: r/w/x   everyone: r/e
+
+    // build an output path
+    char out_path[512];
+    snprintf(out_path, sizeof(out_path), "get_cmd_output/%s", parts[n_parts - 1]);  // ex: "get_cmd_output/filename.[exetension]"
+
+    int out_fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    
+    // walk the cluster chain, read data, write to stdout AND file
+    uint32_t cluster = fs.cluster;
+    uint32_t bytes_left = fs.file_size;
+
+    uint8_t *buf = malloc(bytes_per_clus);
+
+    // loop until eoc or all bytes read
+    while (!is_eoc(cluster) && cluster != 0 && cluster != FAT32_BAD && bytes_left > 0)
+    {
+        off_t off = cluster_to_offset(cluster);
+        uint32_t to_read = bytes_per_clus < bytes_left ? bytes_per_clus : bytes_left;
+
+        disk_read(off, buf, to_read);
+
+        // stdout
+        if (write(STDOUT_FILENO, buf, to_read) != (ssize_t)to_read)
+        {
+            perror("write stdout");
+        }
+
+        // file
+        if (write(out_fd, buf, to_read) != (ssize_t)to_read)
+        {    
+            perror("write file");
+        }
+
+        // subtract bytes just read
+        bytes_left -= to_read;
+        
+        // get next cluster
+        cluster = fat_entry(cluster);
+    }
+
+    free(buf);
+    close(out_fd);
+    free(path_copy);
+
+    fprintf(stderr, "\nFile written to %s\n", out_path);
+}
 
 
 /* -----------------------------------
@@ -452,7 +600,7 @@ int main(int argc, char *argv[])
             return EXIT_FAILURE;
         }
 
-        // cmd_get(argv[3]);
+        cmd_get(argv[3]);
     }
     else {
         fprintf(stderr, "Unknown command: %s, exiting ...\n", command);

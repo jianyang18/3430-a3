@@ -11,3 +11,4 @@ $(TARGET): $(SRC) fat32.h
 
 clean:
 	rm -f $(TARGET)
+	rm -rf get_cmd_output/
