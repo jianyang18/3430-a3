@@ -27,7 +27,11 @@
 /* -----------------------------------
  * constants
  * --------------------------------- */
-#define FAT32_MASK      0x0FFFFFFFu
+#define FAT32_MASK 0x0FFFFFFFu
+#define FAT32_BAD 0x0FFFFFF7u
+#define FAT32_EOC_MIN 0x0FFFFFF8u
+#define DIR_ENTRY_SIZE 32
+
 
 
 /* -----------------------------------
@@ -39,6 +43,13 @@ static uint32_t first_data_sec;  // first sector of data region
 static uint32_t bytes_per_clus; // bytes in one cluster
 static uint32_t fat_start_byte; // byte offset of FAT region
 
+/* -----------------------------------
+ * struct
+ * --------------------------------- */
+struct list_state {
+    int depth;
+};
+
 
 /* -----------------------------------
  * helpers
@@ -48,7 +59,7 @@ static void disk_read(off_t offset, void *buf, size_t size)
     // lseek to move the file reader to exact offset value
     if (lseek(image_fd, offset, SEEK_SET) == (off_t)-1)
     {
-        fprintf(stderr, "Error seeking the offset, exisiting ...\n");
+        fprintf(stderr, "Error seeking the offset, exiting ...\n");
 
         exit(EXIT_FAILURE);
     }
@@ -58,7 +69,7 @@ static void disk_read(off_t offset, void *buf, size_t size)
     // if result < 0 -> read on error, if != size -> got fewer bytes than requested
     if (result < 0 || (size_t)result != size)
     {
-        fprintf(stderr, "Error reading the disk, exisiting ...\n");
+        fprintf(stderr, "Error reading the disk, exiting ...\n");
 
         exit(EXIT_FAILURE);
     }
@@ -90,6 +101,158 @@ static uint32_t fat_entry(uint32_t cluster)
     disk_read(offset, &entry, sizeof(entry));   // seek to that byte offset and read 4 bytes into entry
     
     return entry & FAT32_MASK;  // need to mask off top 4 bits -> FAT32 entries are 28 btis, should ignore
+}
+
+/*
+*   builds a printable 8.3 name for the 11-byte dir_name field
+*   called in list_cb(for printing dirs and files)
+*/
+
+static void format_83(char *dst, const char *raw)
+{
+    char base[9] = {0};
+    char ext[4] = {0};  // "dot" and file ext
+
+    copy_name(base, raw, 8);
+    copy_name(ext, raw+8, 3);   // assemble both
+
+    if (ext[0] != '\0')
+        snprintf(dst, 13, "%s.%s", base, ext);  // if there's a file exetension, attach it
+    else
+        snprintf(dst, 13, "%s", base);
+}
+
+// ======== recursively listing from the root cluster  =========
+/* Forward declaration for recursion */
+static void list_dir(uint32_t cluster, int depth);
+
+
+
+/*
+* test if cluster value signals eoc (end of chain)
+*/
+static int is_eoc(uint32_t fat_val)
+{
+    return fat_val >= FAT32_EOC_MIN;
+}
+
+/* 
+* Return byte offset of the first byte of cluster N 
+*/
+static off_t cluster_to_offset(uint32_t cluster)
+{
+    uint32_t sector = ((cluster - 2) * image_bs.BPB_SecPerClus) + first_data_sec;
+
+    return (off_t)sector * image_bs.BPB_BytesPerSec;
+}
+
+
+typedef void (*dir_callback)(const struct DirInfo *entry, void *userdata);
+
+static void list_cb(const struct DirInfo *e, void *user_data)
+{
+    struct list_state *st = (struct list_state *)user_data; // cast back to list_state
+    int depth = st->depth;  // get depth
+
+    char name83[13];    // to store short names (12 for 8.3 name + NUL) (for spec doc)
+    format_83(name83, e->dir_name);
+
+    // print leading dashes to represents depth
+    for (int i = 0; i < depth; i++)
+    {
+        printf("-");
+    }
+
+    // check if it's directory
+    if (e->dir_attr & ATTR_DIRECTORY)   // bitwise AND to check if the ATTR_DIRECTORY bit is set in the attribute byte
+    {
+        printf("[DIRECTORY]: %s\n", name83);
+
+        // recurse
+        uint32_t sub_cluster =
+            ((uint32_t)e->dir_first_cluster_hi << 16) |
+             (uint32_t)e->dir_first_cluster_lo;
+        list_dir(sub_cluster, depth + 1);
+    }
+    else{
+        // not a directory -> file
+        printf("File: %s\n", name83);
+    }
+
+}
+
+/*
+*
+*/
+static void walk_dir(uint32_t root_cluster, dir_callback cb, void *userdata)
+{
+    uint32_t cluster = root_cluster;
+
+    while(!is_eoc(cluster) && cluster != 0 && cluster != FAT32_BAD)
+    {
+        off_t base = cluster_to_offset(cluster);    // convert cluster num to byte
+        uint32_t entries_per_cluster = bytes_per_clus / DIR_ENTRY_SIZE;
+    
+        // for each cluster, loop through it
+        for (uint32_t i = 0; i < entries_per_cluster; i++)  
+        {
+            uint8_t raw[DIR_ENTRY_SIZE];    // 32-byte buffer to hold one raw directory entry
+
+            disk_read(base + (off_t)(i * DIR_ENTRY_SIZE), raw, DIR_ENTRY_SIZE);
+
+            // first byte 0x00 = no more entries in this directory, done
+            if (raw[0] == 0x00)   
+            {    
+                return;
+            }
+
+            // first byte 0xE5 = deleted entry, skip it
+            if ((uint8_t)raw[0] == 0xE5)
+            {
+                continue;
+            }
+
+            // get attribute bit (11)
+            uint8_t attr = raw[11];
+
+            // validate
+                // if lower 4 bits are all set = long name entry, skip
+            if ((attr & 0x0F) == 0x0F) {
+                continue;
+            }
+
+                // volume label entry, skip
+            if (attr & ATTR_VOLUME_ID)
+            {
+                continue;
+            }
+
+            struct DirInfo entry;
+            memcpy(&entry, raw, DIR_ENTRY_SIZE);
+
+            // skip  dot and dot dot
+            if (entry.dir_name[0] == '.')
+            {
+                continue;
+            }
+
+            cb(&entry, userdata);
+        }
+
+        // move to next cluster
+        cluster = fat_entry(cluster);
+    }
+
+}
+
+
+/*
+*  wrapper around walk_dir
+*/
+static void list_dir(uint32_t cluster, int depth)
+{
+    struct list_state st = { depth };   // curr depth value
+    walk_dir(cluster, list_cb, &st);
 }
 
 
@@ -193,13 +356,63 @@ static void print_info()
 }
 
 /* -----------------------------------
+ * COMMAND 2: list 
+ *  list all files and directories on the drive
+ * --------------------------------- */
+static void cmd_list()
+{
+    // get basic info about image
+    uint32_t bps = image_bs.BPB_BytesPerSec;
+    uint32_t spc = image_bs.BPB_SecPerClus;
+
+    // validate fat[0] and fat[1]
+    uint32_t fat0 = fat_entry(0);
+    uint32_t fat1 = fat_entry(1);
+
+    // find root cluster
+    uint32_t root = image_bs.BPB_RootClus;  // root directory, always 2 on FAT32
+
+    // get root cluster address
+    uint32_t root_sector = ((root - 2) * spc) + first_data_sec;
+
+    // volume label
+    char vol_label[BS_VolLab_LENGTH + 1];
+    copy_name(vol_label, image_bs.BS_VolLab, BS_VolLab_LENGTH);
+
+
+    printf("Drive has %u Bytes per sector and %u sectors per cluster\n", bps, spc);
+    
+    printf("0x%08x should be 0x%08x\n", fat0 | 0xF0000000u, 0xfffffff8u);
+    
+    printf("0x%08x should be 0x%08x\n", fat1 | 0xF0000000u, 0xffffffffu);   // because fat_entry() masks off the top 4 bits
+    printf("Searching for root cluster at %u\n", root);
+    
+    printf("Sector 2 address is %u\n", root_sector * bps);  // byte offset
+    printf("Sector 2 address is %u\n", root_sector);    // sector num
+
+    printf("Volume ID: %s\n", vol_label);
+
+    list_dir(root, 0);
+}
+
+/* -----------------------------------
+ * COMMAND 3: get 
+ *  
+ * --------------------------------- */
+// static void cmd_get(const char *path)
+// {
+    
+// }
+
+
+/* -----------------------------------
  * main()
  * --------------------------------- */
 int main(int argc, char *argv[])
 {
     // handle args
     if (argc < 3) {
-        fprintf(stderr, "Error reading command, existing ...\n");
+        fprintf(stderr, "Error reading command, exiting ...\n");
 
         return EXIT_FAILURE;
     }
@@ -212,7 +425,7 @@ int main(int argc, char *argv[])
     
     if (image_fd < 0)
     {
-        fprintf(stderr, "Error reading disk file, existing ...\n");
+        fprintf(stderr, "Error reading disk file, exiting ...\n");
 
         return EXIT_FAILURE;
     }
@@ -228,14 +441,21 @@ int main(int argc, char *argv[])
     }
     else if (strcmp(command, "list") == 0)
     {
-        printf("list");
+        cmd_list();
     }
     else if (strcmp(command, "get") == 0)
     {
-        printf("get");
+        if (argc != 4)
+        {
+            fprintf(stderr, "Unknown command, exiting ...\n");
+
+            return EXIT_FAILURE;
+        }
+
+        // cmd_get(argv[3]);
     }
     else {
-        fprintf(stderr, "Unknown command: %s, existing ...\n", command);
+        fprintf(stderr, "Unknown command: %s, exiting ...\n", command);
         close(image_fd);
 
         return EXIT_FAILURE;
